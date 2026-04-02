@@ -1,0 +1,36 @@
+name: PhD Tracker Daily Check
+
+on:
+  schedule:
+    # Runs at 08:00 UTC every day
+    - cron: '0 8 */4 * *'
+  workflow_dispatch: # Allows manual trigger button
+
+jobs:
+  check-vacancies:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Tracker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: python main.py --once
