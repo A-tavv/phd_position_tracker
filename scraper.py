@@ -147,15 +147,12 @@ class BaseScraper(ABC):
         if self._matches_any_keyword(combined, config.EXCLUDED_KEYWORDS):
             return False
 
-        # Require an explicit doctoral marker in the title to avoid generic
-        # "research" roles whose description happens to mention PhD candidates.
+        # Match only on the vacancy title to avoid metadata fields such as
+        # research area or employer descriptions broadening the results.
         if not re.search(r"\b(phd|doctoral|doctorate)\b", title_text, re.IGNORECASE):
             return False
 
-        if self._matches_any_keyword(title_text, config.KEYWORDS):
-            return True
-
-        return self._matches_any_keyword(combined, config.CONTEXT_KEYWORDS)
+        return self._matches_any_keyword(title_text, config.KEYWORDS)
 
     def _format_status_codes(self) -> str:
         if not self.report["status_codes"]:

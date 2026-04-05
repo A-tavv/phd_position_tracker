@@ -31,7 +31,6 @@ class TelegramNotifier:
         return (
             "New PhD vacancy found\n\n"
             f"Title: {job['title']}\n"
-            f"Employer: {job['employer']}\n"
             f"Location: {job['location']}\n"
             f"Source: {job.get('source', 'Unknown')}\n"
             f"Link: {job['url']}"
