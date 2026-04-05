@@ -13,6 +13,20 @@ from storage import get_seen_jobs_store
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+def format_source_summary(source_reports: list[dict]) -> str:
+    lines = ["Source details:"]
+    for report in source_reports:
+        line = (
+            f"- {report['source']}: matched={report['matched_items']}, raw={report['raw_items']}, "
+            f"pages={report['pages_scanned']}, requests={report['requests']}, "
+            f"http={report['status_codes']}, retries={report['retries']}, stop={report['stop_reason'] or 'unknown'}"
+        )
+        if report["errors"]:
+            line += f", last_error={report['errors'][-1]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def job():
     logging.info("Starting scheduled job check...")
 
@@ -21,11 +35,39 @@ def job():
     seen_jobs_store = get_seen_jobs_store()
 
     all_jobs = []
+    source_reports = []
     for scraper in scrapers:
         try:
-            all_jobs.extend(scraper.scrape())
+            source_jobs = scraper.scrape()
+            all_jobs.extend(source_jobs)
+            report = scraper.get_report()
+            source_reports.append(report)
+            logging.info(
+                "%s summary: matched=%s raw=%s pages=%s requests=%s http=%s retries=%s stop=%s",
+                report["source"],
+                report["matched_items"],
+                report["raw_items"],
+                report["pages_scanned"],
+                report["requests"],
+                report["status_codes"],
+                report["retries"],
+                report["stop_reason"],
+            )
         except Exception as exc:
             logging.error("Scraper failed: %s", exc)
+            source_reports.append(
+                {
+                    "source": getattr(scraper, "source_name", scraper.__class__.__name__),
+                    "matched_items": 0,
+                    "raw_items": 0,
+                    "pages_scanned": 0,
+                    "requests": 0,
+                    "status_codes": "none",
+                    "retries": 0,
+                    "stop_reason": "exception",
+                    "errors": [str(exc)],
+                }
+            )
 
     deduped_jobs = []
     seen_keys = set()
@@ -44,6 +86,7 @@ def job():
 
     new_jobs = [job_item for job_item in deduped_jobs if seen_jobs_store.mark_if_new(job_item["id"])]
     logging.info("Found %s unseen vacancies to send.", len(new_jobs))
+    source_summary = format_source_summary(source_reports)
 
     sent_jobs = 0
     for job_item in new_jobs:
@@ -55,12 +98,13 @@ def job():
     if sent_jobs == 0:
         logging.info("No new matching vacancies found.")
         notifier.send_message(
-            f"Scan finished.\nChecked {len(config.SOURCES)} sources.\nFound {len(deduped_jobs)} matches total.\n0 new jobs sent."
+            f"Scan finished.\nChecked {len(config.SOURCES)} sources.\nFound {len(deduped_jobs)} matches total.\n"
+            f"0 new jobs sent.\n{source_summary}"
         )
     else:
         logging.info("Sent notifications for %s vacancies.", sent_jobs)
         notifier.send_message(
-            f"Scan finished.\nFound {len(deduped_jobs)} matches total.\nSent {sent_jobs} new jobs."
+            f"Scan finished.\nFound {len(deduped_jobs)} matches total.\nSent {sent_jobs} new jobs.\n{source_summary}"
         )
 
 

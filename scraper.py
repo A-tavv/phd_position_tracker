@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
 from abc import ABC, abstractmethod
 from typing import Dict, List
+from urllib.parse import quote_plus
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import requests
@@ -17,6 +19,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 class BaseScraper(ABC):
+    source_name = "Unknown"
+
     def __init__(self) -> None:
         self.session = requests.Session()
         self.session.headers.update(
@@ -28,21 +32,93 @@ class BaseScraper(ABC):
                 )
             }
         )
+        self._keyword_patterns: dict[str, re.Pattern[str]] = {}
+        self._reset_report()
+
+    def _reset_report(self) -> None:
+        self.report = {
+            "source": self.source_name,
+            "requests": 0,
+            "pages_scanned": 0,
+            "raw_items": 0,
+            "matched_items": 0,
+            "retries": 0,
+            "empty_pages": 0,
+            "status_codes": {},
+            "errors": [],
+            "stop_reason": "",
+        }
+
+    def _record_status(self, status_code: int) -> None:
+        status_key = str(status_code)
+        self.report["status_codes"][status_key] = self.report["status_codes"].get(status_key, 0) + 1
+
+    def _record_error(self, message: str) -> None:
+        if len(self.report["errors"]) < 5:
+            self.report["errors"].append(message)
+
+    def _sleep_with_backoff(self, attempt: int, retry_after: str | None = None) -> None:
+        if retry_after and retry_after.isdigit():
+            wait_seconds = max(config.REQUEST_RETRY_BACKOFF_SECONDS, float(retry_after))
+        else:
+            wait_seconds = config.REQUEST_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+        time.sleep(wait_seconds)
 
     def _get_soup(self, url: str) -> BeautifulSoup:
-        response = self.session.get(url, timeout=config.REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        return BeautifulSoup(response.text, "html.parser")
+        last_exc: requests.RequestException | None = None
+        for attempt in range(config.REQUEST_RETRY_ATTEMPTS):
+            try:
+                response = self.session.get(url, timeout=config.REQUEST_TIMEOUT_SECONDS)
+                self.report["requests"] += 1
+                self._record_status(response.status_code)
+                response.raise_for_status()
+                return BeautifulSoup(response.text, "html.parser")
+            except requests.RequestException as exc:
+                last_exc = exc
+                self._record_error(f"{type(exc).__name__}: {exc}")
+                if attempt == config.REQUEST_RETRY_ATTEMPTS - 1:
+                    break
+                self.report["retries"] += 1
+                retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+                self._sleep_with_backoff(attempt, retry_after)
+        raise last_exc if last_exc else requests.RequestException(f"Request failed for {url}")
+
+    def _get_json(self, url: str, headers: dict[str, str] | None = None) -> dict:
+        last_exc: requests.RequestException | None = None
+        for attempt in range(config.REQUEST_RETRY_ATTEMPTS):
+            try:
+                response = self.session.get(url, timeout=config.REQUEST_TIMEOUT_SECONDS, headers=headers)
+                self.report["requests"] += 1
+                self._record_status(response.status_code)
+                response.raise_for_status()
+                return response.json()
+            except requests.RequestException as exc:
+                last_exc = exc
+                self._record_error(f"{type(exc).__name__}: {exc}")
+                if attempt == config.REQUEST_RETRY_ATTEMPTS - 1:
+                    break
+                self.report["retries"] += 1
+                retry_after = getattr(getattr(exc, "response", None), "headers", {}).get("Retry-After")
+                self._sleep_with_backoff(attempt, retry_after)
+        raise last_exc if last_exc else requests.RequestException(f"Request failed for {url}")
 
     def _build_keyword_pattern(self, keyword: str) -> re.Pattern[str]:
+        cached = self._keyword_patterns.get(keyword)
+        if cached:
+            return cached
+
         normalized = keyword.strip().lower()
         parts = [part for part in re.split(r"[\s/-]+", normalized) if part]
 
         if not parts:
-            return re.compile(r"$^")
+            pattern = re.compile(r"$^")
+            self._keyword_patterns[keyword] = pattern
+            return pattern
 
         if len(parts) == 1 and parts[0].isalpha() and len(parts[0]) <= 3:
-            return re.compile(rf"(?<![a-z]){re.escape(parts[0])}(?![a-z])", re.IGNORECASE)
+            pattern = re.compile(rf"(?<![a-z]){re.escape(parts[0])}(?![a-z])", re.IGNORECASE)
+            self._keyword_patterns[keyword] = pattern
+            return pattern
 
         token_patterns = []
         for part in parts:
@@ -53,7 +129,9 @@ class BaseScraper(ABC):
                 token_patterns.append(escaped)
 
         joiner = r"[\s/-]+"
-        return re.compile(rf"\b{joiner.join(token_patterns)}\b", re.IGNORECASE)
+        pattern = re.compile(rf"\b{joiner.join(token_patterns)}\b", re.IGNORECASE)
+        self._keyword_patterns[keyword] = pattern
+        return pattern
 
     def _matches_any_keyword(self, text: str, keywords: List[str]) -> bool:
         return any(self._build_keyword_pattern(keyword).search(text) for keyword in keywords)
@@ -64,15 +142,34 @@ class BaseScraper(ABC):
 
         title_text = title.strip()
         context_text = context.strip() if context else title_text
-
-        if self._matches_any_keyword(context_text, config.EXCLUDED_KEYWORDS):
-            return False
-
-        if not re.search(r"\bphd\b", context_text, re.IGNORECASE):
-            return False
-
         combined = f"{title_text} {context_text}"
-        return self._matches_any_keyword(combined, config.KEYWORDS)
+
+        if self._matches_any_keyword(combined, config.EXCLUDED_KEYWORDS):
+            return False
+
+        # Require an explicit doctoral marker in the title to avoid generic
+        # "research" roles whose description happens to mention PhD candidates.
+        if not re.search(r"\b(phd|doctoral|doctorate)\b", title_text, re.IGNORECASE):
+            return False
+
+        if self._matches_any_keyword(title_text, config.KEYWORDS):
+            return True
+
+        return self._matches_any_keyword(combined, config.CONTEXT_KEYWORDS)
+
+    def _format_status_codes(self) -> str:
+        if not self.report["status_codes"]:
+            return "none"
+        return ",".join(
+            f"{status}:{count}" for status, count in sorted(self.report["status_codes"].items(), key=lambda item: int(item[0]))
+        )
+
+    def get_report(self) -> dict:
+        return {
+            **self.report,
+            "status_codes": self._format_status_codes(),
+            "errors": list(self.report["errors"]),
+        }
 
     @abstractmethod
     def scrape(self) -> List[Dict]:
@@ -80,42 +177,45 @@ class BaseScraper(ABC):
 
 
 class AcademicTransferScraper(BaseScraper):
+    source_name = "AcademicTransfer"
+
     def scrape(self) -> List[Dict]:
+        self._reset_report()
         jobs: List[Dict] = []
         seen_urls = set()
-        seen_page_signatures = set()
+        token = self._get_public_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json; version=2",
+            "Accept-Language": "en",
+        }
 
         for page in range(config.ACADEMICTRANSFER_MAX_PAGES):
-            page_url = self._page_url(config.ACADEMICTRANSFER_URL, page)
-            logging.info("Scanning AcademicTransfer page %s: %s", page + 1, page_url)
-            try:
-                soup = self._get_soup(page_url)
-            except requests.RequestException as exc:
-                logging.error("AcademicTransfer request failed on page %s: %s", page + 1, exc)
+            offset = page * 10
+            api_url = self._api_url(offset)
+            logging.info("Scanning AcademicTransfer page %s: %s", page + 1, api_url)
+            self.report["pages_scanned"] += 1
+
+            payload = self._get_payload_with_empty_retry(api_url, headers, page + 1)
+            results = payload.get("results", [])
+            self.report["raw_items"] += len(results)
+
+            if not results:
+                self.report["stop_reason"] = "empty_results"
                 break
 
-            cards = soup.select("article.text-aqua-500")
+            for item in results:
+                href = item.get("absolute_url", "").strip()
+                title = item.get("title", "").strip()
+                description = self._html_to_text(item.get("description", ""))
+                excerpt = self._html_to_text(item.get("excerpt", ""))
+                organisation = item.get("organisation_name", "").strip() or "AcademicTransfer"
+                location = item.get("city", "").strip() or "Netherlands"
+                context = " ".join(
+                    part for part in [title, excerpt, description, organisation, location] if part
+                )
 
-            if not cards:
-                break
-
-            first_link = cards[0].select_one('a[href^="/en/jobs/"], a[href*="/en/jobs/"]')
-            signature = first_link.get("href", "").strip() if first_link else f"page-{page}"
-            if signature in seen_page_signatures:
-                break
-            seen_page_signatures.add(signature)
-
-            for card in cards:
-                link = card.select_one('a[href^="/en/jobs/"], a[href*="/en/jobs/"]')
-                title_node = card.select_one("h3")
-                if not link or not title_node:
-                    continue
-
-                href = urljoin("https://www.academictransfer.com", link.get("href", "").strip())
-                title = title_node.get_text(" ", strip=True)
-                context = card.get_text(" ", strip=True)
-
-                if href in seen_urls or not self._is_relevant_job(title, context):
+                if not href or href in seen_urls or not self._is_relevant_job(title, context):
                     continue
 
                 seen_urls.add(href)
@@ -123,35 +223,74 @@ class AcademicTransferScraper(BaseScraper):
                     {
                         "title": title,
                         "url": href,
-                        "employer": self._extract_employer(card),
-                        "location": "Netherlands",
+                        "employer": organisation,
+                        "location": location,
                         "id": href,
-                        "source": "AcademicTransfer",
+                        "source": self.source_name,
                     }
                 )
 
+            next_url = payload.get("next")
+            if not next_url:
+                self.report["stop_reason"] = "no_next_page"
+                break
+
             time.sleep(config.REQUEST_DELAY_SECONDS)
+
+        self.report["matched_items"] = len(jobs)
+        if not self.report["stop_reason"]:
+            self.report["stop_reason"] = "max_pages_reached"
 
         return jobs
 
-    def _page_url(self, base_url: str, page: int) -> str:
-        parsed = urlparse(base_url)
-        query = parse_qs(parsed.query, keep_blank_values=True)
-        if page:
-            query["page"] = [str(page)]
-        else:
-            query.pop("page", None)
-        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+    def _get_public_access_token(self) -> str:
+        soup = self._get_soup(config.ACADEMICTRANSFER_URL)
+        payload_node = soup.select_one("#__NUXT_DATA__")
+        if not payload_node or not payload_node.string:
+            raise ValueError("AcademicTransfer public token payload was not found.")
 
-    def _extract_employer(self, card: BeautifulSoup) -> str:
-        text = card.get_text("\n", strip=True)
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if len(lines) >= 2:
-            return lines[1]
-        return "AcademicTransfer"
+        payload = json.loads(payload_node.string)
+        match = re.search(r'\$satDataApiPublicAccessToken":(\d+)', payload_node.string)
+        if not match:
+            raise ValueError("AcademicTransfer public token reference was not found.")
+
+        token_index = int(match.group(1))
+        token = payload[token_index]
+        if not isinstance(token, str) or not token:
+            raise ValueError("AcademicTransfer public token value is invalid.")
+        return token
+
+    def _api_url(self, offset: int) -> str:
+        search = quote_plus(config.ACADEMICTRANSFER_SEARCH_TERM)
+        return (
+            "https://api.academictransfer.com/vacancies/"
+            f"?boost_spotlights=true&is_active=true&limit=10&offset={offset}"
+            f"&search={search}&smcv=false&smrp=false"
+        )
+
+    def _get_payload_with_empty_retry(self, api_url: str, headers: dict[str, str], page_number: int) -> dict:
+        for attempt in range(config.EMPTY_PAGE_RETRY_ATTEMPTS + 1):
+            payload = self._get_json(api_url, headers=headers)
+            if payload.get("results"):
+                return payload
+            self.report["empty_pages"] += 1
+            if attempt == config.EMPTY_PAGE_RETRY_ATTEMPTS:
+                logging.warning("AcademicTransfer page %s returned empty results after retries.", page_number)
+                return payload
+            self.report["retries"] += 1
+            self._sleep_with_backoff(attempt)
+        return {}
+
+    def _html_to_text(self, value: str) -> str:
+        if not value:
+            return ""
+        return BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
 
 class EuraxessScraper(BaseScraper):
+    source_name = "EURAXESS"
+
     def scrape(self) -> List[Dict]:
+        self._reset_report()
         jobs: List[Dict] = []
         seen_urls = set()
         max_pages = config.EURAXESS_MAX_PAGES
@@ -159,15 +298,19 @@ class EuraxessScraper(BaseScraper):
         for page in range(max_pages):
             page_url = self._page_url(page)
             logging.info("Scanning EURAXESS page %s: %s", page + 1, page_url)
+            self.report["pages_scanned"] += 1
             try:
-                soup = self._get_soup(page_url)
+                soup = self._get_soup_with_empty_retry(page_url, page + 1)
             except requests.RequestException as exc:
                 logging.error("EURAXESS request failed on page %s: %s", page + 1, exc)
+                self.report["stop_reason"] = f"request_failed_page_{page + 1}"
                 break
 
             cards = soup.select("article.ecl-content-item")
+            self.report["raw_items"] += len(cards)
 
             if not cards:
+                self.report["stop_reason"] = "empty_results"
                 break
 
             if page == 0:
@@ -199,11 +342,30 @@ class EuraxessScraper(BaseScraper):
                 )
 
             if not self._has_next_page(soup):
+                self.report["stop_reason"] = "no_next_page"
                 break
 
             time.sleep(config.REQUEST_DELAY_SECONDS)
 
+        self.report["matched_items"] = len(jobs)
+        if not self.report["stop_reason"]:
+            self.report["stop_reason"] = "max_pages_reached"
         return jobs
+
+    def _get_soup_with_empty_retry(self, url: str, page_number: int) -> BeautifulSoup:
+        last_soup: BeautifulSoup | None = None
+        for attempt in range(config.EMPTY_PAGE_RETRY_ATTEMPTS + 1):
+            soup = self._get_soup(url)
+            last_soup = soup
+            if soup.select("article.ecl-content-item"):
+                return soup
+            self.report["empty_pages"] += 1
+            if attempt == config.EMPTY_PAGE_RETRY_ATTEMPTS:
+                logging.warning("EURAXESS page %s returned no cards after retries.", page_number)
+                return soup
+            self.report["retries"] += 1
+            self._sleep_with_backoff(attempt)
+        return last_soup if last_soup else BeautifulSoup("", "html.parser")
 
     def _page_url(self, page: int) -> str:
         parsed = urlparse(config.EURAXESS_URL)
