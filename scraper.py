@@ -342,7 +342,7 @@ class EuraxessScraper(BaseScraper):
                 self.report["stop_reason"] = "no_next_page"
                 break
 
-            time.sleep(config.REQUEST_DELAY_SECONDS)
+            time.sleep(config.EURAXESS_REQUEST_DELAY_SECONDS)
 
         self.report["matched_items"] = len(jobs)
         if not self.report["stop_reason"]:
