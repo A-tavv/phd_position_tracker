@@ -46,6 +46,7 @@ EXCLUDED_KEYWORDS = [
 # Main Netherlands-focused sources
 ACADEMICTRANSFER_URL = "https://www.academictransfer.com/en/jobs?q=&vacancy_type=all"
 EURAXESS_URL = "https://euraxess.ec.europa.eu/jobs/search?f%5B0%5D=job_country%3A798&f%5B1%5D=offer_type%3Ajob_offer&page=0"
+EURAXESS_COUNTRY_NAME = "Netherlands"
 ACADEMICTRANSFER_SEARCH_TERM = "phd"
 
 SOURCES = [

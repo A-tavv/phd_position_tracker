@@ -42,6 +42,7 @@ class BaseScraper(ABC):
             "pages_scanned": 0,
             "raw_items": 0,
             "matched_items": 0,
+            "off_country_items": 0,
             "retries": 0,
             "empty_pages": 0,
             "status_codes": {},
@@ -321,6 +322,11 @@ class EuraxessScraper(BaseScraper):
                 href = urljoin("https://euraxess.ec.europa.eu", title_link.get("href", "").strip())
                 title = title_link.get_text(" ", strip=True)
                 context = card.get_text(" ", strip=True)
+                location = self._extract_work_location(card)
+
+                if not self._is_target_country(location):
+                    self.report["off_country_items"] += 1
+                    continue
 
                 if href in seen_urls or not self._is_relevant_job(title, context):
                     continue
@@ -332,7 +338,7 @@ class EuraxessScraper(BaseScraper):
                         "title": title,
                         "url": href,
                         "employer": employer_node.get_text(" ", strip=True) if employer_node else "EURAXESS",
-                        "location": "Netherlands",
+                        "location": location,
                         "id": href,
                         "source": "EURAXESS",
                     }
@@ -369,6 +375,24 @@ class EuraxessScraper(BaseScraper):
         query = parse_qs(parsed.query, keep_blank_values=True)
         query["page"] = [str(page)]
         return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+    def _extract_work_location(self, card: BeautifulSoup) -> str:
+        location_block = card.select_one(".id-Work-Locations .ecl-text-standard")
+        if not location_block:
+            return config.EURAXESS_COUNTRY_NAME
+
+        location_text = location_block.get_text(" ", strip=True)
+        parts = [part.strip() for part in location_text.split(",") if part.strip()]
+        if len(parts) >= 4 and parts[0].lower().startswith("number of offers"):
+            country = parts[1]
+            city = parts[3]
+            return f"{country}, {city}"
+        if len(parts) >= 2 and parts[0].lower().startswith("number of offers"):
+            return parts[1]
+        return location_text
+
+    def _is_target_country(self, location: str) -> bool:
+        return bool(location) and location.lower().startswith(config.EURAXESS_COUNTRY_NAME.lower())
 
     def _has_next_page(self, soup: BeautifulSoup) -> bool:
         return bool(soup.select_one('.ecl-pagination__item--next a[href]'))

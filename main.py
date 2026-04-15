@@ -19,7 +19,8 @@ def format_source_summary(source_reports: list[dict]) -> str:
         line = (
             f"- {report['source']}: matched={report['matched_items']}, raw={report['raw_items']}, "
             f"pages={report['pages_scanned']}, requests={report['requests']}, "
-            f"http={report['status_codes']}, retries={report['retries']}, stop={report['stop_reason'] or 'unknown'}"
+            f"http={report['status_codes']}, retries={report['retries']}, "
+            f"off_country={report.get('off_country_items', 0)}, stop={report['stop_reason'] or 'unknown'}"
         )
         if report["errors"]:
             line += f", last_error={report['errors'][-1]}"
