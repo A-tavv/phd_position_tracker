@@ -33,6 +33,7 @@ class BaseScraper(ABC):
             }
         )
         self._keyword_patterns: dict[str, re.Pattern[str]] = {}
+        self._detail_cache: dict[str, dict[str, str]] = {}
         self._reset_report()
 
     def _reset_report(self) -> None:
@@ -43,6 +44,7 @@ class BaseScraper(ABC):
             "raw_items": 0,
             "matched_items": 0,
             "off_country_items": 0,
+            "detail_validations": 0,
             "retries": 0,
             "empty_pages": 0,
             "status_codes": {},
@@ -322,14 +324,22 @@ class EuraxessScraper(BaseScraper):
                 href = urljoin("https://euraxess.ec.europa.eu", title_link.get("href", "").strip())
                 title = title_link.get_text(" ", strip=True)
                 context = card.get_text(" ", strip=True)
-                location = self._extract_work_location(card)
-
-                if not self._is_target_country(location):
-                    self.report["off_country_items"] += 1
-                    continue
 
                 if href in seen_urls or not self._is_relevant_job(title, context):
                     continue
+
+                card_location = self._extract_work_location(card)
+                detail_metadata = self._get_detail_metadata(href)
+                self.report["detail_validations"] += 1
+
+                country = detail_metadata.get("country") or self._extract_country_from_location(card_location)
+                if not self._is_target_country(country):
+                    self.report["off_country_items"] += 1
+                    continue
+
+                location = card_location
+                if detail_metadata.get("location"):
+                    location = detail_metadata["location"]
 
                 seen_urls.add(href)
                 employer_node = card.select_one(".ecl-content-block__primary-meta-item a")
@@ -391,8 +401,39 @@ class EuraxessScraper(BaseScraper):
             return parts[1]
         return location_text
 
-    def _is_target_country(self, location: str) -> bool:
-        return bool(location) and location.lower().startswith(config.EURAXESS_COUNTRY_NAME.lower())
+    def _extract_country_from_location(self, location: str) -> str:
+        parts = [part.strip() for part in location.split(",") if part.strip()]
+        return parts[0] if parts else location
+
+    def _get_detail_metadata(self, href: str) -> dict[str, str]:
+        cached = self._detail_cache.get(href)
+        if cached is not None:
+            return cached
+
+        metadata = {"country": "", "location": ""}
+        try:
+            soup = self._get_soup(href)
+        except requests.RequestException as exc:
+            self._record_error(f"Detail validation failed for {href}: {exc}")
+            self._detail_cache[href] = metadata
+            return metadata
+
+        for details in soup.select("dl.ecl-description-list"):
+            terms = details.select("dt.ecl-description-list__term")
+            definitions = details.select("dd.ecl-description-list__definition")
+            for term, definition in zip(terms, definitions):
+                label = term.get_text(" ", strip=True).lower()
+                value = definition.get_text(" ", strip=True)
+                if label == "country":
+                    metadata["country"] = value
+                elif label.startswith("work location"):
+                    metadata["location"] = value
+
+        self._detail_cache[href] = metadata
+        return metadata
+
+    def _is_target_country(self, country_or_location: str) -> bool:
+        return bool(country_or_location) and country_or_location.lower().startswith(config.EURAXESS_COUNTRY_NAME.lower())
 
     def _has_next_page(self, soup: BeautifulSoup) -> bool:
         return bool(soup.select_one('.ecl-pagination__item--next a[href]'))
